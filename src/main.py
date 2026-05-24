@@ -9,7 +9,8 @@ import torch
 from insightface.app import FaceAnalysis
 
 from config import (
-    VIDEO_PATH, DISPLAY_SIZE, FRAME_SKIP, INSIGHTFACE_DET,
+    VIDEO_PATH, DISPLAY_SIZE, FRAME_SKIP,
+    INSIGHTFACE_MODEL, INSIGHTFACE_DET_THRESH,
     REANALYZE_BUCKETS, AD_COOLDOWN, AD_PATHS,
     STABLE_FRAMES_REQUIRED, STABLE_CONF_THRESHOLD,
     PRECISION_FRAMES_REQUIRED, PRECISION_CONF_THRESHOLD, PRECISION_BBOX_AREA,
@@ -25,16 +26,19 @@ from vision.identity import (
 )
 from vision.workers import (
     setup as workers_setup, start_workers,
-    enqueue_insightface, enqueue_deepface,
+    enqueue_insightface_frame, enqueue_deepface,
 )
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-face_app = FaceAnalysis(allowed_modules=["detection", "genderage"])
+face_app = FaceAnalysis(
+    name=INSIGHTFACE_MODEL,
+    allowed_modules=["detection", "genderage"],
+)
 face_app.prepare(
     ctx_id=0 if torch.cuda.is_available() else -1,
-    det_size=INSIGHTFACE_DET
+    det_thresh=INSIGHTFACE_DET_THRESH,
 )
 print("InsightFace ready")
 
@@ -94,6 +98,10 @@ while True:
     active_ids   = set()
     audience_ids = set()
 
+    # Batch collections for analysis (populated during detection loop)
+    persons_needing_if = {}   # {person_id: (x1, y1, x2, y2)}
+    persons_needing_df = []   # [(person_id, x1, y1, x2, y2)]
+
     for det in detections:
         person_id       = det["person_id"]
         conf            = det["conf"]
@@ -140,7 +148,7 @@ while True:
             audience_ids.add(person_id)
 
         # -------------------------------------------------------------------
-        # 3. Analysis gating
+        # 3. Analysis gating — collect persons needing analysis
         # -------------------------------------------------------------------
         time_since = now - last_analyzed
         if facing_away:
@@ -155,24 +163,9 @@ while True:
             )
 
         if should_analyze:
-            # Reliable 40% head crop — no pose dependency
-            bbox_h  = y2 - y1
-            pad     = max(10, int(bbox_h * 0.05))
-            head_y2 = y1 + int(bbox_h * 0.40)
-            cx1     = max(0, x1 - pad)
-            cy1     = max(0, y1 - pad)
-            cx2     = min(frame.shape[1], x2 + pad)
-            cy2     = min(frame.shape[0], head_y2 + pad)
-            crop    = frame[cy1:cy2, cx1:cx2].copy()
-
-            if crop.size > 0:
-                if tier == "precision":
-                    enqueue_deepface(person_id, crop)
-                else:
-                    enqueue_insightface(person_id, crop)
-                with memory_lock:
-                    if person_id in identity_memory:
-                        identity_memory[person_id]["last_analyzed"] = now
+            persons_needing_if[person_id] = (x1, y1, x2, y2)
+            if tier == "precision":
+                persons_needing_df.append((person_id, x1, y1, x2, y2))
 
         # -------------------------------------------------------------------
         # 4. Draw
@@ -232,6 +225,28 @@ while True:
         cv2.rectangle(debug_frame, (x1, y1 - th - 12), (x1 + tw + 6, y1), (0, 0, 0), -1)
         cv2.putText(debug_frame, label, (x1 + 3, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, txt_color, 1)
+
+    # -----------------------------------------------------------------------
+    # 4b. Batch enqueue — full-frame InsightFace + per-person DeepFace
+    # -----------------------------------------------------------------------
+    if persons_needing_if:
+        enqueue_insightface_frame(frame, persons_needing_if)
+        with memory_lock:
+            for pid in persons_needing_if:
+                if pid in identity_memory:
+                    identity_memory[pid]["last_analyzed"] = now
+
+    for pid, bx1, by1, bx2, by2 in persons_needing_df:
+        bbox_h  = by2 - by1
+        pad     = max(10, int(bbox_h * 0.05))
+        head_y2 = by1 + int(bbox_h * 0.40)
+        cx1     = max(0, bx1 - pad)
+        cy1     = max(0, by1 - pad)
+        cx2     = min(frame.shape[1], bx2 + pad)
+        cy2     = min(frame.shape[0], head_y2 + pad)
+        crop    = frame[cy1:cy2, cx1:cx2].copy()
+        if crop.size > 0:
+            enqueue_deepface(pid, crop)
 
     # -----------------------------------------------------------------------
     # 5. Cleanup (throttled — once per second)

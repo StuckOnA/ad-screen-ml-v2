@@ -8,8 +8,9 @@ DISPLAY_SIZE = (1280, 720)
 FRAME_SKIP   = 2
 
 # --- Models ---
-YOLO_MODEL      = "yolov8n.pt"       # back to standard detection model
-INSIGHTFACE_DET = (640, 640)
+YOLO_MODEL              = "yolov8n.pt"
+INSIGHTFACE_MODEL       = "antelopev2"   # ResNet100@Glint360K — best accuracy
+INSIGHTFACE_DET_THRESH  = 0.3            # Lower threshold (YOLO already confirms person)
 
 # --- Detection ---
 MIN_DETECTION_CONF = 0.4

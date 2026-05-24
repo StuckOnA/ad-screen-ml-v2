@@ -17,7 +17,9 @@ MIN_CROP_SIZE = 40
 AGE_MIN       = 5
 AGE_MAX       = 90
 
-if_queue  = queue.Queue(maxsize=50)
+# Full-frame queue: (frame_rgb, person_bboxes_dict)
+# maxsize=2 prevents frame buildup — drops when worker is busy
+if_queue  = queue.Queue(maxsize=2)
 df_queue  = queue.Queue(maxsize=50)
 _face_app = None
 
@@ -27,9 +29,15 @@ def setup(app_instance) -> None:
     _face_app = app_instance
 
 
-def enqueue_insightface(person_id: int, crop) -> None:
-    if not if_queue.full():
-        if_queue.put((person_id, crop))
+def enqueue_insightface_frame(frame, person_bboxes: dict) -> None:
+    """
+    Enqueue a full frame + person bboxes for InsightFace analysis.
+    person_bboxes: {person_id: (x1, y1, x2, y2)}
+    """
+    if if_queue.full():
+        return
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if_queue.put((frame_rgb, person_bboxes))
 
 
 def enqueue_deepface(person_id: int, crop) -> None:
@@ -50,6 +58,46 @@ def _clamp_age(age) -> int | None:
         return age if AGE_MIN <= age <= AGE_MAX else None
     except (TypeError, ValueError):
         return None
+
+
+def _match_faces_to_persons(faces, person_bboxes: dict) -> tuple[dict, set]:
+    """
+    Match InsightFace detected faces to YOLO person bounding boxes.
+
+    For each face, find the person bbox that contains its center.
+    If multiple persons contain the same face center, assign to the
+    person whose bbox center is closest (Manhattan distance).
+    If multiple faces match one person, keep the highest det_score.
+
+    Returns:
+        matched:   {person_id: face_object}
+        unmatched: set of person_ids with no face
+    """
+    matched = {}
+
+    for face in faces:
+        fx1, fy1, fx2, fy2 = face.bbox[:4]
+        face_cx = (fx1 + fx2) / 2
+        face_cy = (fy1 + fy2) / 2
+
+        best_pid  = None
+        best_dist = float("inf")
+
+        for pid, (px1, py1, px2, py2) in person_bboxes.items():
+            if px1 <= face_cx <= px2 and py1 <= face_cy <= py2:
+                pcx  = (px1 + px2) / 2
+                pcy  = (py1 + py2) / 2
+                dist = abs(face_cx - pcx) + abs(face_cy - pcy)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pid  = pid
+
+        if best_pid is not None:
+            if best_pid not in matched or face.det_score > matched[best_pid].det_score:
+                matched[best_pid] = face
+
+    unmatched = set(person_bboxes.keys()) - set(matched.keys())
+    return matched, unmatched
 
 
 def _parse_df_gender(res: dict) -> tuple[str, float]:
@@ -78,31 +126,37 @@ def _parse_df_gender(res: dict) -> tuple[str, float]:
 
 
 def insightface_worker() -> None:
+    """
+    Full-frame InsightFace analysis.
+    Receives (frame_rgb, person_bboxes), detects ALL faces in frame,
+    matches them to person bounding boxes, and registers results.
+    """
     while True:
-        person_id, crop = if_queue.get()
+        frame_rgb, person_bboxes = if_queue.get()
         try:
-            if not _is_crop_usable(crop):
-                register_no_face(person_id)
-                continue
-
-            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            faces    = _face_app.get(crop_rgb)
+            faces = _face_app.get(frame_rgb)
 
             if not faces:
-                register_no_face(person_id)
+                for pid in person_bboxes:
+                    register_no_face(pid)
                 continue
 
-            face      = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-            gender    = "M" if face.gender == 1 else "F"
-            age       = _clamp_age(face.age)
-            det_score = float(face.det_score)
+            matched, unmatched = _match_faces_to_persons(faces, person_bboxes)
 
-            register_insightface_result(person_id, gender, age, det_score)
-            print(f"[IF] ID{person_id} | {gender} ~{age} | det={det_score:.2f}")
+            for pid, face in matched.items():
+                gender    = "M" if face.gender == 1 else "F"
+                age       = _clamp_age(face.age)
+                det_score = float(face.det_score)
+                register_insightface_result(pid, gender, age, det_score)
+                print(f"[IF] ID{pid} | {gender} ~{age} | det={det_score:.2f}")
+
+            for pid in unmatched:
+                register_no_face(pid)
 
         except Exception as e:
-            print(f"[IF worker] ID{person_id}: {e}")
-            register_no_face(person_id)
+            print(f"[IF worker] error: {e}")
+            for pid in person_bboxes:
+                register_no_face(pid)
         finally:
             if_queue.task_done()
 
@@ -124,17 +178,15 @@ def deepface_worker() -> None:
             )
             res = results[0] if isinstance(results, list) else results
 
-            # Check if a face was actually detected
             face_conf = res.get("face_confidence", None)
             if face_conf is None:
-                # Fallback for DeepFace < 0.0.80: check region vs crop size
                 region = res.get("region", {})
                 rw, rh = region.get("w", 0), region.get("h", 0)
                 ch, cw = crop.shape[:2]
                 if rw == 0 or rh == 0 or (rw >= cw * 0.9 and rh >= ch * 0.9):
                     register_no_face(person_id)
                     continue
-                face_conf = 0.6  # detected face, unknown confidence
+                face_conf = 0.6
             elif face_conf < 0.5:
                 register_no_face(person_id)
                 continue
