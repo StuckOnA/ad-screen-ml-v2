@@ -1,151 +1,145 @@
 # =============================================================================
 # vision/workers.py
-#
-# Background AI workers for InsightFace (Standard) and DeepFace (Precision).
-# Implements robust gender mapping, resolution gating, and bounded age tracking.
 # =============================================================================
 
 import cv2
 import queue
 import threading
+
 from deepface import DeepFace
 from vision.identity import (
     register_insightface_result,
     register_deepface_result,
-    register_no_face
+    register_no_face,
 )
 
-# ---------------------------------------------------------------------------
-# State & Queues
-# ---------------------------------------------------------------------------
-if_queue = queue.Queue(maxsize=50)
-df_queue = queue.Queue(maxsize=50)
-face_app_instance = None
+MIN_CROP_SIZE = 40
+AGE_MIN       = 5
+AGE_MAX       = 90
 
-def setup(app_instance):
-    """Stores the InsightFace instance created in main.py"""
-    global face_app_instance
-    face_app_instance = app_instance
+if_queue  = queue.Queue(maxsize=50)
+df_queue  = queue.Queue(maxsize=50)
+_face_app = None
+
+
+def setup(app_instance) -> None:
+    global _face_app
+    _face_app = app_instance
+
 
 def enqueue_insightface(person_id: int, crop) -> None:
     if not if_queue.full():
         if_queue.put((person_id, crop))
 
+
 def enqueue_deepface(person_id: int, crop) -> None:
     if not df_queue.full():
         df_queue.put((person_id, crop))
 
-# ---------------------------------------------------------------------------
-# Standard Tier: InsightFace Worker
-# ---------------------------------------------------------------------------
-def insightface_worker():
-    """Fast, lightweight analysis for stable tracking targets."""
+
+def _is_crop_usable(crop) -> bool:
+    if crop is None or crop.size == 0:
+        return False
+    h, w = crop.shape[:2]
+    return h >= MIN_CROP_SIZE and w >= MIN_CROP_SIZE
+
+
+def _clamp_age(age) -> int | None:
+    try:
+        age = int(age)
+        return age if AGE_MIN <= age <= AGE_MAX else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_df_gender(res: dict) -> tuple[str, float]:
+    """
+    Extract gender and confidence from DeepFace result.
+    Uses raw probability scores to avoid Male bias.
+    Returns ("M" | "F" | "?", confidence 0.0-1.0).
+    """
+    gender_data = res.get("gender", {})
+
+    if isinstance(gender_data, dict) and gender_data:
+        w_score = float(gender_data.get("Woman", gender_data.get("female", 0)))
+        m_score = float(gender_data.get("Man",   gender_data.get("male",   0)))
+        gap     = abs(w_score - m_score) / 100.0
+
+        if gap < 0.15:
+            return "?", gap
+        return ("F" if w_score > m_score else "M"), gap
+
+    dominant = res.get("dominant_gender", "")
+    if dominant:
+        gender = "F" if str(dominant).lower() in ["woman", "female", "w", "f"] else "M"
+        return gender, 0.5
+
+    return "?", 0.0
+
+
+def insightface_worker() -> None:
     while True:
         person_id, crop = if_queue.get()
         try:
-            # 1. Resolution Gate: Reject crops too small for accurate age/gender math
-            if crop.shape[0] < 30 or crop.shape[1] < 30:
+            if not _is_crop_usable(crop):
                 register_no_face(person_id)
                 continue
-                
-            faces = face_app_instance.get(crop)
+
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            faces    = _face_app.get(crop_rgb)
+
             if not faces:
                 register_no_face(person_id)
                 continue
-                
-            face = faces[0]  # Take the most prominent face in the tight crop
-            
-            # 2. Robust Gender Mapping
-            # The standard mapping is 0 = Female, 1 = Male. 
-            # If your specific model weights are still flipping the genders, 
-            # simply swap the "F" and "M" strings below.
-            INSIGHTFACE_GENDER_MAP = {
-                0: "F",  
-                1: "M"   
-            }
-            
-            # Safely extract the attribute (handles different library versions)
-            raw_gender = getattr(face, "gender", getattr(face, "sex", None))
-            if raw_gender is not None:
-                gender = INSIGHTFACE_GENDER_MAP.get(int(raw_gender), "?")
-            else:
-                gender = "?"
-            
-            # 3. Bounded Age Extraction
-            raw_age = getattr(face, "age", None)
-            if raw_age is not None and raw_age > 0:
-                # Cap ages to realistic human bounds to prevent wild median skewing
-                age = max(1, min(100, int(raw_age)))
-            else:
-                age = None
-                
-            register_insightface_result(person_id, gender, age, face.det_score)
+
+            face      = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            gender    = "M" if face.gender == 1 else "F"
+            age       = _clamp_age(face.age)
+            det_score = float(face.det_score)
+
+            register_insightface_result(person_id, gender, age, det_score)
+            print(f"[IF] ID{person_id} | {gender} ~{age} | det={det_score:.2f}")
 
         except Exception as e:
+            print(f"[IF worker] ID{person_id}: {e}")
             register_no_face(person_id)
-            print(f"[WARN] InsightFace worker error on ID {person_id}: {e}")
         finally:
             if_queue.task_done()
 
-# ---------------------------------------------------------------------------
-# Precision Tier: DeepFace Worker
-# ---------------------------------------------------------------------------
-def deepface_worker():
-    """Heavyweight, high-accuracy analysis for primary audience members."""
+
+def deepface_worker() -> None:
     while True:
         person_id, crop = df_queue.get()
         try:
-            # 1. Resolution Gate: DeepFace requires slightly more data for high accuracy
-            if crop.shape[0] < 45 or crop.shape[1] < 45:
+            if not _is_crop_usable(crop):
                 register_no_face(person_id)
                 continue
-                
-            # enforce_detection=False prevents DeepFace from crashing if its 
-            # internal detector disagrees with YOLO's bounding box.
+
             results = DeepFace.analyze(
-                img_path=crop,
-                actions=['age', 'gender', 'emotion'],
-                enforce_detection=False, 
-                silent=True
+                img_path          = crop,
+                actions           = ["age", "gender", "emotion"],
+                enforce_detection = False,
+                detector_backend  = "retinaface",
+                silent            = True,
             )
-            
-            # Unpack list if DeepFace returns multiple faces
             res = results[0] if isinstance(results, list) else results
-            
-            # 2. Version-Agnostic Gender Extraction
-            gender_data = res.get("gender", {})
-            if isinstance(gender_data, dict):
-                # Cascading fallback through every key DeepFace has ever used
-                w_score = gender_data.get("Woman", gender_data.get("Female", gender_data.get("female", 0)))
-                m_score = gender_data.get("Man", gender_data.get("Male", gender_data.get("male", 0)))
-                gender = "F" if w_score > m_score else "M"
-            else:
-                # Absolute fallback if a specific version returns just a raw string
-                g_str = str(gender_data).lower()
-                gender = "F" if "wom" in g_str or "fem" in g_str else "M"
-                
-            # 3. Bounded Age Extraction
-            raw_age = res.get("age")
-            age = max(1, min(100, int(raw_age))) if raw_age is not None else None
-            
-            # 4. Emotion Extraction
-            emotion = res.get("dominant_emotion")
-            emo_scores = res.get("emotion", {})
-            conf = res.get("face_confidence", 1.0)
-            
+
+            gender, conf = _parse_df_gender(res)
+            age          = _clamp_age(res.get("age"))
+            emotion      = res.get("dominant_emotion")
+            emo_scores   = res.get("emotion", {})
+
             register_deepface_result(person_id, gender, age, emotion, emo_scores, conf)
+            print(f"[DF] ID{person_id} | {gender} ~{age} | {emotion} | conf={conf:.2f}")
 
         except Exception as e:
+            print(f"[DF worker] ID{person_id}: {e}")
             register_no_face(person_id)
-            # Suppressing the exact error print here is recommended as DeepFace 
-            # throws verbose ValueErrors frequently on blurry crops.
         finally:
             df_queue.task_done()
 
-# ---------------------------------------------------------------------------
-# Thread Initialization
-# ---------------------------------------------------------------------------
-def start_workers():
-    """Spin up the daemon threads."""
+
+def start_workers() -> None:
     threading.Thread(target=insightface_worker, daemon=True, name="IF_Worker").start()
-    threading.Thread(target=deepface_worker, daemon=True, name="DF_Worker").start()
+    threading.Thread(target=deepface_worker,    daemon=True, name="DF_Worker").start()
+    print("Analysis workers started (IF + DF)")
