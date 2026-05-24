@@ -17,8 +17,8 @@ from config import (
     PRECISION_BBOX_AREA,
     REANALYZE_BUCKETS,
     REANALYZE_NONE,
-    BUCKET_HIGH_THRESHOLD,
-    BUCKET_MEDIUM_THRESHOLD,
+    AGREEMENT_HIGH_THRESHOLD,
+    AGREEMENT_LOW_THRESHOLD,
     FACING_AWAY_MISS_THRESHOLD,
     FACING_AWAY_INITIAL_THRESHOLD,
 )
@@ -41,7 +41,6 @@ def new_entry(conf: float, now: float, bbox_area: int = 0) -> dict:
         "gender":             "?",
         "emotion":            None,
         "source":             None,
-        "result_confidence":  None,
         "history_age":        [],
         "history_gender":     [],
         "history_emotion":    [],
@@ -78,24 +77,37 @@ def get_analysis_tier(mem: dict, bbox_area: int) -> str:
         return "noisy"
 
 
+def _compute_agreement(mem: dict) -> float:
+    """
+    Compute agreement score from gender history.
+    Returns 0.0-1.0 based on how consistent results are.
+    Higher = more consistent = model is more "sure".
+    """
+    history = mem.get("history_gender", [])
+    if not history:
+        return 0.0
+    most_common_count = Counter(history).most_common(1)[0][1]
+    return most_common_count / len(history)
+
+
 def get_reanalyze_interval(mem: dict) -> float:
-    score = mem.get("result_confidence", None)
-    if score is None:
+    agreement = _compute_agreement(mem)
+    if agreement == 0.0:
         return REANALYZE_NONE
-    elif score >= BUCKET_HIGH_THRESHOLD:
+    elif agreement >= AGREEMENT_HIGH_THRESHOLD:
         return REANALYZE_BUCKETS["high"]
-    elif score >= BUCKET_MEDIUM_THRESHOLD:
+    elif agreement >= AGREEMENT_LOW_THRESHOLD:
         return REANALYZE_BUCKETS["medium"]
     else:
         return REANALYZE_BUCKETS["low"]
 
 
 def bucket_label(mem: dict) -> str:
-    score = mem.get("result_confidence", None)
-    if score is None:                      return "?"
-    elif score >= BUCKET_HIGH_THRESHOLD:   return "H"
-    elif score >= BUCKET_MEDIUM_THRESHOLD: return "M"
-    else:                                  return "L"
+    agreement = _compute_agreement(mem)
+    if agreement == 0.0:                        return "?"
+    elif agreement >= AGREEMENT_HIGH_THRESHOLD: return "H"
+    elif agreement >= AGREEMENT_LOW_THRESHOLD:  return "M"
+    else:                                       return "L"
 
 
 def register_insightface_result(person_id: int, gender: str,
@@ -104,9 +116,8 @@ def register_insightface_result(person_id: int, gender: str,
         if person_id not in identity_memory:
             return
         mem = identity_memory[person_id]
-        mem["last_analyzed"]     = time.time()
-        mem["source"]            = "IF"
-        mem["result_confidence"] = det_score
+        mem["last_analyzed"]      = time.time()
+        mem["source"]             = "IF"
         mem["consecutive_misses"] = 0
         mem["facing_away"]        = False
 
@@ -132,7 +143,6 @@ def register_deepface_result(person_id: int, gender: str, age: int,
         mem = identity_memory[person_id]
         mem["last_analyzed"]      = time.time()
         mem["source"]             = "DF"
-        mem["result_confidence"]  = conf
         mem["consecutive_misses"] = 0
         mem["facing_away"]        = False
 
@@ -170,7 +180,6 @@ def register_no_face(person_id: int) -> None:
                          else FACING_AWAY_MISS_THRESHOLD)
 
         mem["last_analyzed"]      = time.time()
-        mem["result_confidence"]  = 0.0
         mem["consecutive_misses"] += 1
 
         if mem["consecutive_misses"] >= threshold:

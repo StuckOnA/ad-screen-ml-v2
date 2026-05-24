@@ -35,9 +35,10 @@ REANALYZE_BUCKETS = {
 }
 REANALYZE_NONE = 1.0
 
-# --- Bucket confidence thresholds ---
-BUCKET_HIGH_THRESHOLD   = 0.80
-BUCKET_MEDIUM_THRESHOLD = 0.55
+# --- Agreement thresholds (for reanalysis frequency) ---
+# Based on consistency of gender history, not detection confidence
+AGREEMENT_HIGH_THRESHOLD  = 0.80   # 4/5+ agree → slow reanalysis
+AGREEMENT_LOW_THRESHOLD   = 0.60   # 3/5+ agree → medium reanalysis
 
 # --- Stale ID timeout ---
 STALE_TIMEOUT = 5.0

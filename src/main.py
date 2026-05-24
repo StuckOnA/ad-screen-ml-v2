@@ -140,14 +140,19 @@ while True:
             audience_ids.add(person_id)
 
         # -------------------------------------------------------------------
-        # 3. Analysis gating — periodic recheck for facing-away
+        # 3. Analysis gating
         # -------------------------------------------------------------------
-        should_analyze = (
-            tier != "noisy" and
-            (now - last_analyzed) > reanalyze_interval and
-            (not facing_away or
-             (now - last_analyzed) > FACING_AWAY_RECHECK_INTERVAL)
-        )
+        time_since = now - last_analyzed
+        if facing_away:
+            should_analyze = (
+                tier != "noisy" and
+                time_since > FACING_AWAY_RECHECK_INTERVAL
+            )
+        else:
+            should_analyze = (
+                tier != "noisy" and
+                time_since > reanalyze_interval
+            )
 
         if should_analyze:
             # Reliable 40% head crop — no pose dependency
