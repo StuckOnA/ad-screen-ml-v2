@@ -6,44 +6,31 @@ import cv2
 import numpy as np
 import time
 import torch
-from insightface.app import FaceAnalysis
 
 from config import (
     VIDEO_PATH, DISPLAY_SIZE, FRAME_SKIP,
-    INSIGHTFACE_MODEL, INSIGHTFACE_DET_SIZE, INSIGHTFACE_DET_THRESH,
+    MIVOLO_MODEL,
     AD_COOLDOWN, AD_PATHS,
-    STABLE_FRAMES_REQUIRED, STABLE_CONF_THRESHOLD,
-    PRECISION_FRAMES_REQUIRED, PRECISION_CONF_THRESHOLD, PRECISION_BBOX_AREA,
     FACING_AWAY_RECHECK_INTERVAL,
 )
-from vision.detector import Detector
+from vision.detector import Detector, associate_faces_to_persons
 from vision.identity import (
     identity_memory, memory_lock,
     new_entry, update_entry,
-    get_analysis_tier, get_reanalyze_interval, is_stable,
+    get_reanalyze_interval, is_stable,
     bucket_label, get_entry_snapshot, get_snapshot,
     prune_stale_identities,
 )
 from vision.workers import (
     setup as workers_setup, start_workers,
-    enqueue_insightface_frame, enqueue_deepface,
+    enqueue_mivolo,
 )
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-face_app = FaceAnalysis(
-    name=INSIGHTFACE_MODEL,
-    allowed_modules=["detection", "genderage"],
-)
-face_app.prepare(
-    ctx_id=0 if torch.cuda.is_available() else -1,
-    det_size=INSIGHTFACE_DET_SIZE,
-    det_thresh=INSIGHTFACE_DET_THRESH,
-)
-print("InsightFace ready")
-
-workers_setup(face_app)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+workers_setup(MIVOLO_MODEL, device)
 start_workers()
 detector = Detector()
 
@@ -95,24 +82,28 @@ while True:
     debug_frame = frame.copy()
     now         = time.time()
 
-    detections   = detector.detect(frame)
+    # -----------------------------------------------------------------------
+    # 1. Detection — persons + faces in one pass
+    # -----------------------------------------------------------------------
+    persons, faces = detector.detect(frame)
+    face_map       = associate_faces_to_persons(persons, faces)
+
     active_ids   = set()
     audience_ids = set()
 
-    # Batch collections for analysis (populated during detection loop)
-    persons_needing_if = {}   # {person_id: (x1, y1, x2, y2)}
-    persons_needing_df = []   # [(person_id, x1, y1, x2, y2)]
+    # Collection for MiVOLO analysis
+    persons_needing_analysis = {}  # {person_id: {"person_bbox":..., "face_bbox":...}}
 
-    for det in detections:
-        person_id       = det["person_id"]
-        conf            = det["conf"]
+    for det in persons:
+        person_id = det["person_id"]
+        conf      = det["conf"]
         x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
-        bbox_area       = det["bbox_area"]
+        bbox_area = det["bbox_area"]
 
         active_ids.add(person_id)
 
         # -------------------------------------------------------------------
-        # 1. Update identity memory
+        # 2. Update identity memory
         # -------------------------------------------------------------------
         with memory_lock:
             if person_id not in identity_memory:
@@ -120,9 +111,9 @@ while True:
             else:
                 update_entry(identity_memory[person_id], conf, now, bbox_area)
 
-            mem     = identity_memory[person_id]
+            mem = identity_memory[person_id]
 
-            # movement tracking
+            # Movement tracking
             history = mem["area_history"]
             history.append(bbox_area)
             if len(history) > 30:
@@ -137,44 +128,44 @@ while True:
                 else:
                     mem["movement"] = "stable"
 
-            tier               = get_analysis_tier(mem, bbox_area)
             last_analyzed      = mem["last_analyzed"]
             reanalyze_interval = get_reanalyze_interval(mem)
             facing_away        = mem["facing_away"]
 
         # -------------------------------------------------------------------
-        # 2. Audience — stable + not facing away
+        # 3. Audience — stable + not facing away
         # -------------------------------------------------------------------
         if is_stable(mem) and not facing_away:
             audience_ids.add(person_id)
 
         # -------------------------------------------------------------------
-        # 3. Analysis gating — collect persons needing analysis
+        # 4. Analysis gating
         # -------------------------------------------------------------------
+        stable = is_stable(mem)
         time_since = now - last_analyzed
+
         if facing_away:
-            should_analyze = (
-                tier != "noisy" and
-                time_since > FACING_AWAY_RECHECK_INTERVAL
-            )
+            should_analyze = stable and time_since > FACING_AWAY_RECHECK_INTERVAL
         else:
-            should_analyze = (
-                tier != "noisy" and
-                time_since > reanalyze_interval
-            )
+            should_analyze = stable and time_since > reanalyze_interval
 
         if should_analyze:
-            persons_needing_if[person_id] = (x1, y1, x2, y2)
-            if tier == "precision":
-                persons_needing_df.append((person_id, x1, y1, x2, y2))
+            face_det = face_map.get(person_id)
+            face_bbox = None
+            if face_det is not None:
+                face_bbox = (face_det["x1"], face_det["y1"],
+                             face_det["x2"], face_det["y2"])
+            persons_needing_analysis[person_id] = {
+                "person_bbox": (x1, y1, x2, y2),
+                "face_bbox":   face_bbox,
+            }
 
         # -------------------------------------------------------------------
-        # 4. Draw
+        # 5. Draw
         # -------------------------------------------------------------------
         snap     = get_entry_snapshot(person_id)
         age      = snap.get("age")
         gender   = snap.get("gender")
-        emotion  = snap.get("emotion")
         movement = snap.get("movement", "stable")
         blabel   = bucket_label(snap)
         source   = snap.get("source", "")
@@ -186,40 +177,21 @@ while True:
             txt_color = (50, 50, 150)
             label     = f"ID{person_id} | away{move_tag}"
             thickness = 1
-
-        elif tier == "noisy":
+        elif not stable:
             box_color = (80, 80, 80)
             txt_color = (80, 80, 80)
             label     = f"ID{person_id} | noisy{move_tag}"
             thickness = 1
-
-        elif tier == "precision":
-            box_color = (0, 165, 255)
-            txt_color = (0, 165, 255)
-            thickness = 2
-            emo_tag   = f" {emotion}" if emotion else ""
-            if age and gender and gender != "?":
-                label = f"ID{person_id} | {gender} ~{age}{emo_tag} [{source}][{blabel}]{move_tag}"
-            else:
-                label = f"ID{person_id} | precision...{move_tag}"
-
         elif age and gender and gender != "?":
             box_color = (0, 255, 0)
             txt_color = (0, 255, 0)
             thickness = 2
             label     = f"ID{person_id} | {gender} ~{age} [{source}][{blabel}]{move_tag}"
-
-        elif is_stable(snap):
+        else:
             box_color = (0, 200, 255)
             txt_color = (0, 200, 255)
             thickness = 2
-            label     = f"ID{person_id} | stable...{move_tag}"
-
-        else:
-            box_color = (80, 80, 80)
-            txt_color = (80, 80, 80)
-            thickness = 1
-            label     = f"ID{person_id} | noisy{move_tag}"
+            label     = f"ID{person_id} | analyzing...{move_tag}"
 
         cv2.rectangle(debug_frame, (x1, y1), (x2, y2), box_color, thickness)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -227,38 +199,34 @@ while True:
         cv2.putText(debug_frame, label, (x1 + 3, y1 - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, txt_color, 1)
 
+        # Draw face bbox if detected (small blue rectangle)
+        face_det = face_map.get(person_id)
+        if face_det is not None:
+            cv2.rectangle(debug_frame,
+                          (face_det["x1"], face_det["y1"]),
+                          (face_det["x2"], face_det["y2"]),
+                          (255, 200, 0), 1)
+
     # -----------------------------------------------------------------------
-    # 4b. Batch enqueue — full-frame InsightFace + per-person DeepFace
+    # 6. Enqueue batch to MiVOLO worker
     # -----------------------------------------------------------------------
-    if persons_needing_if:
-        enqueued = enqueue_insightface_frame(frame, persons_needing_if)
+    if persons_needing_analysis:
+        enqueued = enqueue_mivolo(frame, persons_needing_analysis)
         if enqueued:
             with memory_lock:
-                for pid in persons_needing_if:
+                for pid in persons_needing_analysis:
                     if pid in identity_memory:
                         identity_memory[pid]["last_analyzed"] = now
 
-    for pid, bx1, by1, bx2, by2 in persons_needing_df:
-        bbox_h  = by2 - by1
-        pad     = max(10, int(bbox_h * 0.10))
-        head_y2 = by1 + int(bbox_h * 0.50)
-        cx1     = max(0, bx1 - pad)
-        cy1     = max(0, by1 - pad)
-        cx2     = min(frame.shape[1], bx2 + pad)
-        cy2     = min(frame.shape[0], head_y2 + pad)
-        crop    = frame[cy1:cy2, cx1:cx2].copy()
-        if crop.size > 0:
-            enqueue_deepface(pid, crop)
-
     # -----------------------------------------------------------------------
-    # 5. Cleanup (throttled — once per second)
+    # 7. Cleanup (throttled — once per second)
     # -----------------------------------------------------------------------
     if now - last_prune_time > 1.0:
         prune_stale_identities()
         last_prune_time = now
 
     # -----------------------------------------------------------------------
-    # 6. Mode decision (placeholder)
+    # 8. Mode decision
     # -----------------------------------------------------------------------
     audience_count = len(audience_ids)
     people_count   = len(active_ids)
@@ -275,7 +243,7 @@ while True:
         last_switch_time = now
 
     # -----------------------------------------------------------------------
-    # 7. Ad display (placeholder)
+    # 9. Ad display
     # -----------------------------------------------------------------------
     if current_mode == "empty":
         display = np.zeros((*DISPLAY_SIZE[::-1], 3), dtype=np.uint8)
@@ -289,41 +257,29 @@ while True:
         display = np.zeros((*DISPLAY_SIZE[::-1], 3), dtype=np.uint8)
 
     # -----------------------------------------------------------------------
-    # 8. Dashboard
+    # 10. Dashboard
     # -----------------------------------------------------------------------
-    snap_dict       = get_snapshot()
-    noisy_count     = sum(1 for m in snap_dict.values() if not is_stable(m))
-    away_count      = sum(1 for m in snap_dict.values()
-                          if is_stable(m) and m.get("facing_away"))
-    standard_count  = sum(1 for m in snap_dict.values()
-                          if is_stable(m) and not m.get("facing_away")
-                          and not (
-                              m.get("frames_seen", 0) >= PRECISION_FRAMES_REQUIRED
-                              and m.get("avg_conf", 0) >= PRECISION_CONF_THRESHOLD
-                              and m.get("bbox_area", 0) >= PRECISION_BBOX_AREA
-                          ))
-    precision_count = sum(1 for m in snap_dict.values()
-                          if is_stable(m) and not m.get("facing_away")
-                          and m.get("frames_seen", 0) >= PRECISION_FRAMES_REQUIRED
-                          and m.get("avg_conf", 0)    >= PRECISION_CONF_THRESHOLD
-                          and m.get("bbox_area", 0)   >= PRECISION_BBOX_AREA)
+    snap_dict    = get_snapshot()
+    noisy_count  = sum(1 for m in snap_dict.values() if not is_stable(m))
+    away_count   = sum(1 for m in snap_dict.values()
+                       if is_stable(m) and m.get("facing_away"))
+    active_count = sum(1 for m in snap_dict.values()
+                       if is_stable(m) and not m.get("facing_away"))
 
-    cv2.rectangle(debug_frame, (5, 570), (240, 715), (0, 0, 0), -1)
+    cv2.rectangle(debug_frame, (5, 590), (240, 715), (0, 0, 0), -1)
     cv2.putText(debug_frame, f"Detected:  {people_count}",
-                (10, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+                (10, 610), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
     cv2.putText(debug_frame, f"Audience:  {audience_count}",
-                (10, 610), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                (10, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     cv2.putText(debug_frame, f"Away:      {away_count}",
-                (10, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 150), 1)
+                (10, 650), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 50, 150), 1)
     cv2.putText(debug_frame, f"Noisy:     {noisy_count}",
-                (10, 650), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
-    cv2.putText(debug_frame, f"Stable IF: {standard_count}",
-                (10, 670), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
-    cv2.putText(debug_frame, f"Prec  DF:  {precision_count}",
-                (10, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+                (10, 670), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+    cv2.putText(debug_frame, f"Active:    {active_count}",
+                (10, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
 
     # -----------------------------------------------------------------------
-    # 9. FPS sync
+    # 11. FPS sync
     # -----------------------------------------------------------------------
     elapsed    = time.time() - frame_start
     sleep_time = effective_delay - elapsed

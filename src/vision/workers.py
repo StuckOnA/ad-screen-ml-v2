@@ -1,220 +1,216 @@
 # =============================================================================
-# vision/workers.py
+# vision/workers.py — MiVOLO age/gender classification worker
 # =============================================================================
 
 import cv2
 import queue
 import threading
+import numpy as np
+import torch
 
-from deepface import DeepFace
-from vision.identity import (
-    register_insightface_result,
-    register_deepface_result,
-    register_no_face,
-)
+from vision.identity import register_mivolo_result, register_no_face
 
+# --- Constants ---
 MIN_CROP_SIZE = 40
-AGE_MIN       = 5
-AGE_MAX       = 90
-MIN_DET_SCORE_FOR_ATTRIBUTES = 0.5  # Below this: face found but don't trust gender/age
 
-# Full-frame queue: (frame_rgb, person_bboxes_dict)
-# maxsize=2 prevents frame buildup — drops when worker is busy
-if_queue  = queue.Queue(maxsize=2)
-df_queue  = queue.Queue(maxsize=50)
-_face_app = None
+# --- Queue ---
+# (frame_bgr, targets_dict)
+# targets_dict: {person_id: {"person_bbox": (x1,y1,x2,y2), "face_bbox": (x1,y1,x2,y2)|None}}
+mivolo_queue = queue.Queue(maxsize=2)
 
-
-def setup(app_instance) -> None:
-    global _face_app
-    _face_app = app_instance
+# --- Model state ---
+_model       = None
+_device      = None
+_meta        = None
+_input_size  = None
+_data_config = None
 
 
-def enqueue_insightface_frame(frame, person_bboxes: dict) -> bool:
+def setup(mivolo_checkpoint: str, device: str) -> None:
+    """Load MiVOLO age/gender model."""
+    global _model, _device, _meta, _input_size, _data_config
+
+    from mivolo.model.mi_volo import MiVOLO, Meta
+
+    _device = torch.device(device)
+
+    _meta = Meta().load_from_ckpt(mivolo_checkpoint, disable_faces=False, use_persons=True)
+    print(f"[MiVOLO] Meta: min_age={_meta.min_age}, max_age={_meta.max_age}, "
+          f"avg_age={_meta.avg_age}, input_size={_meta.input_size}")
+
+    _model = MiVOLO(
+        ckpt_path=mivolo_checkpoint,
+        device=device,
+        half=(_device.type != "cpu"),
+        use_persons=True,
+        disable_faces=False,
+        verbose=False,
+    )
+    _input_size  = _model.input_size
+    _data_config = _model.data_config
+    print(f"[MiVOLO] Model loaded. Input size: {_input_size}, device: {device}")
+
+
+def enqueue_mivolo(frame, targets: dict) -> bool:
     """
-    Enqueue a full frame + person bboxes for InsightFace analysis.
-    person_bboxes: {person_id: (x1, y1, x2, y2)}
+    Enqueue a frame + analysis targets for MiVOLO classification.
+    targets: {person_id: {"person_bbox": (x1,y1,x2,y2), "face_bbox": (x1,y1,x2,y2)|None}}
     Returns True if enqueued, False if queue was full.
     """
-    if if_queue.full():
+    if mivolo_queue.full():
         return False
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    if_queue.put((frame_rgb, person_bboxes))
+    mivolo_queue.put((frame, targets))
     return True
 
 
-def enqueue_deepface(person_id: int, crop) -> None:
-    if not df_queue.full():
-        df_queue.put((person_id, crop))
+def _letterbox(im: np.ndarray, new_shape: int) -> np.ndarray:
+    """Resize + pad to square while preserving aspect ratio."""
+    h, w = im.shape[:2]
+    r = min(new_shape / h, new_shape / w)
+    new_h, new_w = int(round(h * r)), int(round(w * r))
+    if (h, w) != (new_h, new_w):
+        im = cv2.resize(im, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    dh = new_shape - new_h
+    dw = new_shape - new_w
+    top, bottom = dh // 2, dh - dh // 2
+    left, right = dw // 2, dw - dw // 2
+    im = cv2.copyMakeBorder(im, top, bottom, left, right,
+                            cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    return im
 
 
-def _is_crop_usable(crop) -> bool:
-    if crop is None or crop.size == 0:
-        return False
-    h, w = crop.shape[:2]
-    return h >= MIN_CROP_SIZE and w >= MIN_CROP_SIZE
+def _preprocess_crop(crop: np.ndarray) -> torch.Tensor:
+    """BGR crop → normalized tensor [1, 3, H, W]."""
+    img = _letterbox(crop, _input_size)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    mean = np.array(_data_config["mean"], dtype=np.float32)
+    std  = np.array(_data_config["std"], dtype=np.float32)
+    img  = (img - mean) / std
+    img  = img.transpose((2, 0, 1))  # HWC → CHW
+    return torch.from_numpy(np.ascontiguousarray(img)).unsqueeze(0)
 
 
-def _clamp_age(age) -> int | None:
-    try:
-        age = int(age)
-        return age if AGE_MIN <= age <= AGE_MAX else None
-    except (TypeError, ValueError):
+def _make_zero_tensor() -> torch.Tensor:
+    """Create a zero-filled 3-channel tensor (used when face/body missing)."""
+    mean = torch.tensor(_data_config["mean"], dtype=torch.float32)
+    std  = torch.tensor(_data_config["std"], dtype=torch.float32)
+    img  = torch.zeros(3, _input_size, _input_size, dtype=torch.float32)
+    # Normalize zeros: (0 - mean) / std
+    for c in range(3):
+        img[c] = (img[c] - mean[c]) / std[c]
+    return img.unsqueeze(0)
+
+
+def _crop_bbox(frame: np.ndarray, bbox: tuple) -> np.ndarray | None:
+    """Crop a bounding box from frame, returns None if too small."""
+    x1, y1, x2, y2 = bbox
+    h, w = frame.shape[:2]
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+    crop = frame[y1:y2, x1:x2]
+    if crop.shape[0] < MIN_CROP_SIZE or crop.shape[1] < MIN_CROP_SIZE:
         return None
+    return crop.copy()
 
 
-def _match_faces_to_persons(faces, person_bboxes: dict) -> tuple[dict, set]:
+def _decode_output(output: torch.Tensor, index: int) -> tuple:
     """
-    Match InsightFace detected faces to YOLO person bounding boxes.
-
-    For each face, find the person bbox that contains its center.
-    If multiple persons contain the same face center, assign to the
-    person whose bbox center is closest (Manhattan distance).
-    If multiple faces match one person, keep the highest det_score.
-
-    Returns:
-        matched:   {person_id: face_object}
-        unmatched: set of person_ids with no face
+    Decode MiVOLO model output for one person.
+    Returns: (gender_str, age_int, gender_score)
     """
-    matched = {}
+    age_raw = output[index, 2].item()
+    age = age_raw * (_meta.max_age - _meta.min_age) + _meta.avg_age
+    age = max(1, min(100, round(age)))
 
-    for face in faces:
-        fx1, fy1, fx2, fy2 = face.bbox[:4]
-        face_cx = (fx1 + fx2) / 2
-        face_cy = (fy1 + fy2) / 2
+    gender_logits = output[index, :2].softmax(-1)
+    gender_score  = gender_logits.max().item()
+    gender_idx    = gender_logits.argmax().item()
+    # MiVOLO: index 0 = male, index 1 = female
+    gender = "M" if gender_idx == 0 else "F"
 
-        best_pid  = None
-        best_dist = float("inf")
-
-        for pid, (px1, py1, px2, py2) in person_bboxes.items():
-            if px1 <= face_cx <= px2 and py1 <= face_cy <= py2:
-                pcx  = (px1 + px2) / 2
-                pcy  = (py1 + py2) / 2
-                dist = abs(face_cx - pcx) + abs(face_cy - pcy)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_pid  = pid
-
-        if best_pid is not None:
-            if best_pid not in matched or face.det_score > matched[best_pid].det_score:
-                matched[best_pid] = face
-
-    unmatched = set(person_bboxes.keys()) - set(matched.keys())
-    return matched, unmatched
+    return gender, age, gender_score
 
 
-def _parse_df_gender(res: dict) -> tuple[str, float]:
+def mivolo_worker() -> None:
     """
-    Extract gender and confidence from DeepFace result.
-    Uses raw probability scores to avoid Male bias.
-    Returns ("M" | "F" | "?", confidence 0.0-1.0).
-    """
-    gender_data = res.get("gender", {})
-
-    if isinstance(gender_data, dict) and gender_data:
-        w_score = float(gender_data.get("Woman", gender_data.get("female", 0)))
-        m_score = float(gender_data.get("Man",   gender_data.get("male",   0)))
-        gap     = abs(w_score - m_score) / 100.0
-
-        if gap < 0.15:
-            return "?", gap
-        return ("F" if w_score > m_score else "M"), gap
-
-    dominant = res.get("dominant_gender", "")
-    if dominant:
-        gender = "F" if str(dominant).lower() in ["woman", "female", "w", "f"] else "M"
-        return gender, 0.5
-
-    return "?", 0.0
-
-
-def insightface_worker() -> None:
-    """
-    Full-frame InsightFace analysis.
-    Receives (frame_rgb, person_bboxes), detects ALL faces in frame,
-    matches them to person bounding boxes, and registers results.
+    Background worker: receives (frame, targets), runs MiVOLO inference,
+    registers results to identity memory.
     """
     while True:
-        frame_rgb, person_bboxes = if_queue.get()
+        frame, targets = mivolo_queue.get()
         try:
-            faces = _face_app.get(frame_rgb)
+            if not targets:
+                continue
 
-            if not faces:
-                for pid in person_bboxes:
+            # Prepare batch
+            face_tensors = []
+            body_tensors = []
+            person_ids   = []
+
+            zero_tensor = _make_zero_tensor()
+
+            for pid, info in targets.items():
+                person_bbox = info["person_bbox"]
+                face_bbox   = info["face_bbox"]
+
+                # Body crop
+                body_crop = _crop_bbox(frame, person_bbox)
+                if body_crop is not None:
+                    body_tensor = _preprocess_crop(body_crop)
+                else:
+                    body_tensor = zero_tensor.clone()
+
+                # Face crop
+                if face_bbox is not None:
+                    face_crop = _crop_bbox(frame, face_bbox)
+                    if face_crop is not None:
+                        face_tensor = _preprocess_crop(face_crop)
+                    else:
+                        face_tensor = zero_tensor.clone()
+                        # Face bbox existed but crop too small → still count as face found
+                else:
+                    face_tensor = zero_tensor.clone()
+
+                face_tensors.append(face_tensor)
+                body_tensors.append(body_tensor)
+                person_ids.append(pid)
+
+            if not person_ids:
+                continue
+
+            # Build 6-channel input: [face_channels, body_channels]
+            faces_batch  = torch.cat(face_tensors, dim=0).to(_device)
+            bodies_batch = torch.cat(body_tensors, dim=0).to(_device)
+            model_input  = torch.cat((faces_batch, bodies_batch), dim=1)
+
+            # Inference
+            output = _model.inference(model_input)
+
+            # Decode and register results
+            for i, pid in enumerate(person_ids):
+                gender, age, gender_score = _decode_output(output, i)
+                face_found = targets[pid]["face_bbox"] is not None
+
+                register_mivolo_result(pid, gender, age, gender_score, face_found)
+
+                if not face_found:
                     register_no_face(pid)
-                continue
 
-            matched, unmatched = _match_faces_to_persons(faces, person_bboxes)
-
-            for pid, face in matched.items():
-                det_score = float(face.det_score)
-                if det_score < MIN_DET_SCORE_FOR_ATTRIBUTES:
-                    # Face found (clears facing_away) but too uncertain for attributes
-                    register_insightface_result(pid, "?", None, det_score)
-                    print(f"[IF] ID{pid} | low-conf face | det={det_score:.2f}")
-                    continue
-                gender    = "F" if face.gender == 1 else "M"
-                age       = _clamp_age(face.age)
-                register_insightface_result(pid, gender, age, det_score)
-                print(f"[IF] ID{pid} | {gender} ~{age} | det={det_score:.2f}")
-
-            for pid in unmatched:
-                register_no_face(pid)
+                tag = "face+body" if face_found else "body-only"
+                print(f"[MV] ID{pid} | {gender} ~{age} | "
+                      f"score={gender_score:.2f} | {tag}")
 
         except Exception as e:
-            print(f"[IF worker] error: {e}")
-            for pid in person_bboxes:
+            print(f"[MiVOLO worker] error: {e}")
+            for pid in targets:
                 register_no_face(pid)
         finally:
-            if_queue.task_done()
-
-
-def deepface_worker() -> None:
-    while True:
-        person_id, crop = df_queue.get()
-        try:
-            if not _is_crop_usable(crop):
-                register_no_face(person_id)
-                continue
-
-            results = DeepFace.analyze(
-                img_path          = crop,
-                actions           = ["age", "gender", "emotion"],
-                enforce_detection = False,
-                detector_backend  = "retinaface",
-                silent            = True,
-            )
-            res = results[0] if isinstance(results, list) else results
-
-            face_conf = res.get("face_confidence", None)
-            if face_conf is None:
-                region = res.get("region", {})
-                rw, rh = region.get("w", 0), region.get("h", 0)
-                ch, cw = crop.shape[:2]
-                if rw == 0 or rh == 0 or (rw >= cw * 0.9 and rh >= ch * 0.9):
-                    register_no_face(person_id)
-                    continue
-                face_conf = 0.6
-            elif face_conf < 0.5:
-                register_no_face(person_id)
-                continue
-
-            gender, _  = _parse_df_gender(res)
-            age        = _clamp_age(res.get("age"))
-            emotion    = res.get("dominant_emotion")
-            emo_scores = res.get("emotion", {})
-
-            register_deepface_result(person_id, gender, age, emotion, emo_scores, face_conf)
-            print(f"[DF] ID{person_id} | {gender} ~{age} | {emotion} | conf={face_conf:.2f}")
-
-        except Exception as e:
-            print(f"[DF worker] ID{person_id}: {e}")
-            register_no_face(person_id)
-        finally:
-            df_queue.task_done()
+            mivolo_queue.task_done()
 
 
 def start_workers() -> None:
-    threading.Thread(target=insightface_worker, daemon=True, name="IF_Worker").start()
-    threading.Thread(target=deepface_worker,    daemon=True, name="DF_Worker").start()
-    print("Analysis workers started (IF + DF)")
+    threading.Thread(target=mivolo_worker, daemon=True, name="MiVOLO_Worker").start()
+    print("[MiVOLO] Worker started")

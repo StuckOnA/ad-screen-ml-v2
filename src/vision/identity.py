@@ -12,9 +12,6 @@ from config import (
     STALE_TIMEOUT,
     STABLE_FRAMES_REQUIRED,
     STABLE_CONF_THRESHOLD,
-    PRECISION_FRAMES_REQUIRED,
-    PRECISION_CONF_THRESHOLD,
-    PRECISION_BBOX_AREA,
     REANALYZE_BUCKETS,
     REANALYZE_NONE,
     AGREEMENT_HIGH_THRESHOLD,
@@ -39,11 +36,10 @@ def new_entry(conf: float, now: float, bbox_area: int = 0) -> dict:
         "consecutive_misses": 0,
         "age":                None,
         "gender":             "?",
-        "emotion":            None,
+        "gender_score":       0.0,
         "source":             None,
         "history_age":        [],
         "history_gender":     [],
-        "history_emotion":    [],
         "bbox_area":          bbox_area,
         "area_history":       [],
         "movement":           "stable",
@@ -64,24 +60,9 @@ def is_stable(mem: dict) -> bool:
     )
 
 
-def get_analysis_tier(mem: dict, bbox_area: int) -> str:
-    if (
-        mem["frames_seen"] >= PRECISION_FRAMES_REQUIRED and
-        mem["avg_conf"]    >= PRECISION_CONF_THRESHOLD  and
-        bbox_area          >= PRECISION_BBOX_AREA
-    ):
-        return "precision"
-    elif is_stable(mem):
-        return "standard"
-    else:
-        return "noisy"
-
-
 def _compute_agreement(mem: dict) -> float:
     """
     Compute agreement score from gender history.
-    Returns 0.0-1.0 based on how consistent results are.
-    Higher = more consistent = model is more "sure".
     Requires minimum 3 readings before trusting agreement.
     """
     history = mem.get("history_gender", [])
@@ -111,16 +92,21 @@ def bucket_label(mem: dict) -> str:
     else:                                       return "L"
 
 
-def register_insightface_result(person_id: int, gender: str,
-                                 age: int, det_score: float) -> None:
+def register_mivolo_result(person_id: int, gender: str, age: int,
+                            gender_score: float, face_found: bool = True) -> None:
+    """Register MiVOLO classification result (gender + age)."""
     with memory_lock:
         if person_id not in identity_memory:
             return
         mem = identity_memory[person_id]
-        mem["last_analyzed"]      = time.time()
-        mem["source"]             = "IF"
-        mem["consecutive_misses"] = 0
-        mem["facing_away"]        = False
+        mem["last_analyzed"]  = time.time()
+        mem["source"]         = "MV"
+        mem["gender_score"]   = gender_score
+
+        # Only clear facing_away when face is actually visible
+        if face_found:
+            mem["consecutive_misses"] = 0
+            mem["facing_away"]        = False
 
         if gender and gender != "?":
             mem["history_gender"].append(gender)
@@ -133,44 +119,12 @@ def register_insightface_result(person_id: int, gender: str,
             if len(mem["history_age"]) > MAX_HISTORY:
                 mem["history_age"].pop(0)
             mem["age"] = int(statistics.median(mem["history_age"]))
-
-
-def register_deepface_result(person_id: int, gender: str, age: int,
-                              emotion: str, emo_scores: dict,
-                              conf: float) -> None:
-    with memory_lock:
-        if person_id not in identity_memory:
-            return
-        mem = identity_memory[person_id]
-        mem["last_analyzed"]      = time.time()
-        mem["source"]             = "DF"
-        mem["consecutive_misses"] = 0
-        mem["facing_away"]        = False
-
-        if gender and gender != "?":
-            mem["history_gender"].append(gender)
-            if len(mem["history_gender"]) > MAX_HISTORY:
-                mem["history_gender"].pop(0)
-            mem["gender"] = Counter(mem["history_gender"]).most_common(1)[0][0]
-
-        if age is not None:
-            mem["history_age"].append(age)
-            if len(mem["history_age"]) > MAX_HISTORY:
-                mem["history_age"].pop(0)
-            mem["age"] = int(statistics.median(mem["history_age"]))
-
-        if emotion:
-            mem["history_emotion"].append(emotion)
-            if len(mem["history_emotion"]) > MAX_HISTORY:
-                mem["history_emotion"].pop(0)
-            mem["emotion"] = Counter(mem["history_emotion"]).most_common(1)[0][0]
 
 
 def register_no_face(person_id: int) -> None:
     """
-    Called when worker finds no face in crop.
+    Called when no face is detected for a person.
     Increments miss counter — if misses exceed threshold, marks facing_away.
-    facing_away flips back to False the moment a face is found again.
     """
     with memory_lock:
         if person_id not in identity_memory:
@@ -180,11 +134,21 @@ def register_no_face(person_id: int) -> None:
         threshold     = (FACING_AWAY_INITIAL_THRESHOLD if never_labeled
                          else FACING_AWAY_MISS_THRESHOLD)
 
-        mem["last_analyzed"]      = time.time()
         mem["consecutive_misses"] += 1
 
         if mem["consecutive_misses"] >= threshold:
             mem["facing_away"] = True
+
+
+def prune_stale_identities() -> None:
+    now = time.time()
+    with memory_lock:
+        stale = [
+            pid for pid, mem in identity_memory.items()
+            if (now - mem.get("last_seen", 0)) > STALE_TIMEOUT
+        ]
+        for pid in stale:
+            del identity_memory[pid]
 
 
 def get_snapshot() -> dict:
