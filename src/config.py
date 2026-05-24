@@ -9,7 +9,8 @@ FRAME_SKIP   = 2
 
 # --- Models ---
 YOLO_MODEL              = "yolov8n.pt"
-INSIGHTFACE_MODEL       = "antelopev2"   # ResNet100@Glint360K — best accuracy
+INSIGHTFACE_MODEL       = "buffalo_l"    # same genderage model, auto-download supported
+INSIGHTFACE_DET_SIZE    = (640, 640)     # explicit (Auto mode is InsightFace 1.0+ only)
 INSIGHTFACE_DET_THRESH  = 0.3            # Lower threshold (YOLO already confirms person)
 
 # --- Detection ---

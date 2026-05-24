@@ -10,7 +10,7 @@ from insightface.app import FaceAnalysis
 
 from config import (
     VIDEO_PATH, DISPLAY_SIZE, FRAME_SKIP,
-    INSIGHTFACE_MODEL, INSIGHTFACE_DET_THRESH,
+    INSIGHTFACE_MODEL, INSIGHTFACE_DET_SIZE, INSIGHTFACE_DET_THRESH,
     REANALYZE_BUCKETS, AD_COOLDOWN, AD_PATHS,
     STABLE_FRAMES_REQUIRED, STABLE_CONF_THRESHOLD,
     PRECISION_FRAMES_REQUIRED, PRECISION_CONF_THRESHOLD, PRECISION_BBOX_AREA,
@@ -38,6 +38,7 @@ face_app = FaceAnalysis(
 )
 face_app.prepare(
     ctx_id=0 if torch.cuda.is_available() else -1,
+    det_size=INSIGHTFACE_DET_SIZE,
     det_thresh=INSIGHTFACE_DET_THRESH,
 )
 print("InsightFace ready")
