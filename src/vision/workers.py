@@ -16,6 +16,7 @@ from vision.identity import (
 MIN_CROP_SIZE = 40
 AGE_MIN       = 5
 AGE_MAX       = 90
+MIN_DET_SCORE_FOR_ATTRIBUTES = 0.5  # Below this: face found but don't trust gender/age
 
 # Full-frame queue: (frame_rgb, person_bboxes_dict)
 # maxsize=2 prevents frame buildup — drops when worker is busy
@@ -29,15 +30,17 @@ def setup(app_instance) -> None:
     _face_app = app_instance
 
 
-def enqueue_insightface_frame(frame, person_bboxes: dict) -> None:
+def enqueue_insightface_frame(frame, person_bboxes: dict) -> bool:
     """
     Enqueue a full frame + person bboxes for InsightFace analysis.
     person_bboxes: {person_id: (x1, y1, x2, y2)}
+    Returns True if enqueued, False if queue was full.
     """
     if if_queue.full():
-        return
+        return False
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     if_queue.put((frame_rgb, person_bboxes))
+    return True
 
 
 def enqueue_deepface(person_id: int, crop) -> None:
@@ -144,9 +147,14 @@ def insightface_worker() -> None:
             matched, unmatched = _match_faces_to_persons(faces, person_bboxes)
 
             for pid, face in matched.items():
-                gender    = "M" if face.gender == 1 else "F"
-                age       = _clamp_age(face.age)
                 det_score = float(face.det_score)
+                if det_score < MIN_DET_SCORE_FOR_ATTRIBUTES:
+                    # Face found (clears facing_away) but too uncertain for attributes
+                    register_insightface_result(pid, "?", None, det_score)
+                    print(f"[IF] ID{pid} | low-conf face | det={det_score:.2f}")
+                    continue
+                gender    = "F" if face.gender == 1 else "M"
+                age       = _clamp_age(face.age)
                 register_insightface_result(pid, gender, age, det_score)
                 print(f"[IF] ID{pid} | {gender} ~{age} | det={det_score:.2f}")
 

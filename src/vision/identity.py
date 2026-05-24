@@ -82,9 +82,10 @@ def _compute_agreement(mem: dict) -> float:
     Compute agreement score from gender history.
     Returns 0.0-1.0 based on how consistent results are.
     Higher = more consistent = model is more "sure".
+    Requires minimum 3 readings before trusting agreement.
     """
     history = mem.get("history_gender", [])
-    if not history:
+    if len(history) < 3:
         return 0.0
     most_common_count = Counter(history).most_common(1)[0][1]
     return most_common_count / len(history)

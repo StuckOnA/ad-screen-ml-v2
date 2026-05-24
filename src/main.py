@@ -11,7 +11,7 @@ from insightface.app import FaceAnalysis
 from config import (
     VIDEO_PATH, DISPLAY_SIZE, FRAME_SKIP,
     INSIGHTFACE_MODEL, INSIGHTFACE_DET_SIZE, INSIGHTFACE_DET_THRESH,
-    REANALYZE_BUCKETS, AD_COOLDOWN, AD_PATHS,
+    AD_COOLDOWN, AD_PATHS,
     STABLE_FRAMES_REQUIRED, STABLE_CONF_THRESHOLD,
     PRECISION_FRAMES_REQUIRED, PRECISION_CONF_THRESHOLD, PRECISION_BBOX_AREA,
     FACING_AWAY_RECHECK_INTERVAL,
@@ -231,16 +231,17 @@ while True:
     # 4b. Batch enqueue — full-frame InsightFace + per-person DeepFace
     # -----------------------------------------------------------------------
     if persons_needing_if:
-        enqueue_insightface_frame(frame, persons_needing_if)
-        with memory_lock:
-            for pid in persons_needing_if:
-                if pid in identity_memory:
-                    identity_memory[pid]["last_analyzed"] = now
+        enqueued = enqueue_insightface_frame(frame, persons_needing_if)
+        if enqueued:
+            with memory_lock:
+                for pid in persons_needing_if:
+                    if pid in identity_memory:
+                        identity_memory[pid]["last_analyzed"] = now
 
     for pid, bx1, by1, bx2, by2 in persons_needing_df:
         bbox_h  = by2 - by1
-        pad     = max(10, int(bbox_h * 0.05))
-        head_y2 = by1 + int(bbox_h * 0.40)
+        pad     = max(10, int(bbox_h * 0.10))
+        head_y2 = by1 + int(bbox_h * 0.50)
         cx1     = max(0, bx1 - pad)
         cy1     = max(0, by1 - pad)
         cx2     = min(frame.shape[1], bx2 + pad)
