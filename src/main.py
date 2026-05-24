@@ -151,8 +151,9 @@ while True:
 
         if should_analyze:
             # Reliable 40% head crop — no pose dependency
-            pad     = 10
-            head_y2 = y1 + int((y2 - y1) * 0.40)
+            bbox_h  = y2 - y1
+            pad     = max(10, int(bbox_h * 0.05))
+            head_y2 = y1 + int(bbox_h * 0.40)
             cx1     = max(0, x1 - pad)
             cy1     = max(0, y1 - pad)
             cx2     = min(frame.shape[1], x2 + pad)

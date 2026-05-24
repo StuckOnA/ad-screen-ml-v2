@@ -9,7 +9,7 @@ FRAME_SKIP   = 2
 
 # --- Models ---
 YOLO_MODEL      = "yolov8n.pt"       # back to standard detection model
-INSIGHTFACE_DET = (320, 320)
+INSIGHTFACE_DET = (640, 640)
 
 # --- Detection ---
 MIN_DETECTION_CONF = 0.4
@@ -24,7 +24,7 @@ PRECISION_BBOX_AREA       = 45000
 
 # --- Facing away (miss-based, no pose model) ---
 FACING_AWAY_MISS_THRESHOLD         = 3   # previously labeled person
-FACING_AWAY_INITIAL_THRESHOLD      = 1   # never labeled person
+FACING_AWAY_INITIAL_THRESHOLD      = 2   # never labeled person
 FACING_AWAY_RECHECK_INTERVAL       = 4.0 # seconds before retrying a facing-away person
 
 # --- Reanalysis buckets ---

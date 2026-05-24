@@ -125,8 +125,17 @@ def deepface_worker() -> None:
             res = results[0] if isinstance(results, list) else results
 
             # Check if a face was actually detected
-            face_conf = res.get("face_confidence", 0)
-            if face_conf < 0.5:
+            face_conf = res.get("face_confidence", None)
+            if face_conf is None:
+                # Fallback for DeepFace < 0.0.80: check region vs crop size
+                region = res.get("region", {})
+                rw, rh = region.get("w", 0), region.get("h", 0)
+                ch, cw = crop.shape[:2]
+                if rw == 0 or rh == 0 or (rw >= cw * 0.9 and rh >= ch * 0.9):
+                    register_no_face(person_id)
+                    continue
+                face_conf = 0.6  # detected face, unknown confidence
+            elif face_conf < 0.5:
                 register_no_face(person_id)
                 continue
 
